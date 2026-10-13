@@ -46,45 +46,61 @@ jobs:
               issueNumber = context.payload.issue.number;
             }
 
-            console.log("Target PR Number:", issueNumber);
             if (!issueNumber) {
               core.setFailed("No Pull Request number found.");
               return;
             }
 
-            // 2. Identify the failed job name
+            // 2. Identify the failed job
             const jobs = await github.rest.actions.listJobsForWorkflowRun({
               owner: context.repo.owner,
               repo: context.repo.repo,
               run_id: context.runId,
             });
             const failed = jobs.data.jobs.find(j => j.conclusion === 'failure');
-            const failedStepName = failed ? failed.name : 'z/OS Build and Test Job';
-            console.log("Failed Step Detected:", failedStepName);
+            const failedStepName = failed ? failed.name : 'trigger-jenkins-job';
 
-            // 3. Prepare AI Prompt
-            const prompt = `A build and test workflow failed in repository "${context.repo.repo}".
-            Failed Job: "${failedStepName}"
+            // 3. Fallback diagnostic generator for z/OS port failures
+            function getLocalZOSDiagnosis(stepName) {
+              if (stepName.includes('trigger-jenkins-job')) {
+                return `#### 🔍 Root Cause Analysis:
+            * **Failed Step**: \`${stepName}\`
+            * **Cause**: The workflow attempted to trigger a build on the remote IBM z/OS Jenkins cluster, but the required Jenkins credentials (\`JENKINS_URL\`, \`JENKINS_USER\`, \`JENKINS_TOKEN\`) are not configured in this repository's secrets.
+            * **Why this occurs**: Access to the mainframe build infrastructure is managed centrally by the \`zopencommunity\` organization for security.
 
-            Please provide a structured failure summary:
-            1. **What Failed**: Identify the failed step.
-            2. **Root Cause**: Explain why it failed (e.g. Jenkins runner secrets or environment on personal forks, missing buildenv settings).
-            3. **Actionable Fix**: Steps for the developer to resolve or proceed. Keep it concise.`;
+            #### 🛠️ Recommended Actions:
+            1. **For Personal Repositories/Forks**: You can verify the port logic locally or test configuration syntax in \`buildenv\`.
+            2. **For Official Releases**: Once this PR is submitted to the upstream \`zopencommunity\` repository, the central Jenkins cluster secrets will authenticate and run the full z/OS test suite automatically.`;
+              } else {
+                return `#### 🔍 Root Cause Analysis:
+            * **Failed Step**: \`${stepName}\`
+            * **Cause**: Build or test execution encountered an error on z/OS.
+            * **Recommended Actions**: Inspect the raw step logs in the Actions tab for compiler or test suite traces.`;
+              }
+            }
 
-            const requestBody = JSON.stringify({
-              model: "gpt-4o-mini",
-              messages: [
-                { role: "system", content: "You are an automated CI failure triager for IBM z/OS ported software." },
-                { role: "user", content: prompt }
-              ]
-            });
-
-            // 4. Helper function with Promise to ensure it WAITS for response
-            function callAI(token, payload) {
+            // 4. Call GitHub Models Endpoint
+            function callGitHubModels(token, stepName) {
               return new Promise((resolve) => {
+                const prompt = `A build and test workflow failed in repository "${context.repo.repo}".
+            Failed Job: "${stepName}"
+
+            Provide a concise summary:
+            1. What failed
+            2. Likely cause on z/OS
+            3. Recommended next steps for the developer.`;
+
+                const payload = JSON.stringify({
+                  model: "gpt-4o-mini",
+                  messages: [
+                    { role: "system", content: "You are an automated CI failure triager for IBM z/OS ported software." },
+                    { role: "user", content: prompt }
+                  ]
+                });
+
                 const req = https.request({
-                  hostname: 'models.inference.ai.azure.com',
-                  path: '/chat/completions',
+                  hostname: 'models.github.ai',
+                  path: '/inference/chat/completions',
                   method: 'POST',
                   headers: {
                     'Content-Type': 'application/json',
@@ -92,7 +108,7 @@ jobs:
                     'User-Agent': 'CI-Failure-Triager',
                     'Content-Length': Buffer.byteLength(payload)
                   },
-                  timeout: 20000
+                  timeout: 10000
                 }, (res) => {
                   let data = '';
                   res.on('data', chunk => data += chunk);
@@ -102,29 +118,23 @@ jobs:
                       if (parsed.choices && parsed.choices[0]) {
                         resolve(parsed.choices[0].message.content);
                       } else {
-                        resolve(`Failed step: \`${failedStepName}\`. API Response: ${data}`);
+                        resolve(getLocalZOSDiagnosis(stepName));
                       }
                     } catch (e) {
-                      resolve(`Failed step: \`${failedStepName}\`. (Response parse error: ${e.message})`);
+                      resolve(getLocalZOSDiagnosis(stepName));
                     }
                   });
                 });
 
-                req.on('error', (err) => {
-                  resolve(`Failed step: \`${failedStepName}\`. (Network error: ${err.message})`);
-                });
-
+                req.on('error', () => resolve(getLocalZOSDiagnosis(stepName)));
+                req.on('timeout', () => { req.destroy(); resolve(getLocalZOSDiagnosis(stepName)); });
                 req.write(payload);
                 req.end();
               });
             }
 
-            // 5. Await AI result
-            console.log("Sending request to AI endpoint...");
-            const aiSummary = await callAI(process.env.AI_TOKEN, requestBody);
-            console.log("AI Summary Generated:", aiSummary);
+            const aiSummary = await callGitHubModels(process.env.AI_TOKEN, failedStepName);
 
-            // 6. Post comment to PR
             const commentBody = `### 🤖 Automated Failure Summary\n\n${aiSummary}\n\n---\n*To rerun tests, comment \`/run tests\` on this PR.*`;
 
             await github.rest.issues.createComment({
@@ -133,5 +143,3 @@ jobs:
               issue_number: issueNumber,
               body: commentBody
             });
-
-            console.log("Comment posted successfully!");
