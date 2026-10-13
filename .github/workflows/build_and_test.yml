@@ -9,7 +9,8 @@ permissions:
 
 on:
   issue_comment:
-    types: [created]
+    types:
+      - created
   pull_request_target:
     types: [opened, synchronize, reopened]
     paths-ignore:
@@ -26,82 +27,111 @@ jobs:
 
   summarize-failure-with-ai:
     needs: build-and-test
-    # Only runs when build-and-test FAILS
     if: always() && needs.build-and-test.result == 'failure'
     runs-on: ubuntu-latest
     steps:
       - name: Analyze failure and post AI comment
         uses: actions/github-script@v7
         env:
-          TOKEN: ${{ secrets.BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+          AI_TOKEN: ${{ secrets.BUMP_TOKEN }}
         with:
           script: |
             const https = require('https');
 
-            // 1. Find which PR this is
-            const issueNumber = context.payload.pull_request 
-              ? context.payload.pull_request.number 
-              : context.payload.issue?.number;
+            // 1. Identify PR Number
+            let issueNumber = null;
+            if (context.payload.pull_request) {
+              issueNumber = context.payload.pull_request.number;
+            } else if (context.payload.issue && context.payload.issue.pull_request) {
+              issueNumber = context.payload.issue.number;
+            }
 
-            if (!issueNumber) return;
+            console.log("Target PR Number:", issueNumber);
+            if (!issueNumber) {
+              core.setFailed("No Pull Request number found.");
+              return;
+            }
 
-            // 2. Identify failed step
+            // 2. Identify the failed job name
             const jobs = await github.rest.actions.listJobsForWorkflowRun({
               owner: context.repo.owner,
               repo: context.repo.repo,
               run_id: context.runId,
             });
             const failed = jobs.data.jobs.find(j => j.conclusion === 'failure');
-            const failedStepName = failed ? failed.name : 'z/OS Build Job';
+            const failedStepName = failed ? failed.name : 'z/OS Build and Test Job';
+            console.log("Failed Step Detected:", failedStepName);
 
-            // 3. Prompt for the AI
+            // 3. Prepare AI Prompt
             const prompt = `A build and test workflow failed in repository "${context.repo.repo}".
             Failed Job: "${failedStepName}"
-            
-            Give a brief summary:
-            1. What failed
-            2. Likely reason on z/OS
-            3. Actionable next steps for the developer.`;
 
-            // 4. Send request to GitHub's AI service
-            const payload = JSON.stringify({
+            Please provide a structured failure summary:
+            1. **What Failed**: Identify the failed step.
+            2. **Root Cause**: Explain why it failed (e.g. Jenkins runner secrets or environment on personal forks, missing buildenv settings).
+            3. **Actionable Fix**: Steps for the developer to resolve or proceed. Keep it concise.`;
+
+            const requestBody = JSON.stringify({
               model: "gpt-4o-mini",
               messages: [
-                { role: "system", content: "You are an automated CI failure triager for z/OS ported software." },
+                { role: "system", content: "You are an automated CI failure triager for IBM z/OS ported software." },
                 { role: "user", content: prompt }
               ]
             });
 
-            const req = https.request({
-              hostname: 'models.inference.ai.azure.com',
-              path: '/chat/completions',
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${process.env.TOKEN}`,
-                'User-Agent': 'CI-Failure-Triager'
-              }
-            }, (res) => {
-              let body = '';
-              res.on('data', chunk => body += chunk);
-              res.on('end', async () => {
-                let aiText = '';
-                try {
-                  const data = JSON.parse(body);
-                  aiText = data.choices[0].message.content;
-                } catch (e) {
-                  aiText = `Failed job: \`${failedStepName}\`. Please inspect raw logs in the Actions tab.`;
-                }
-
-                // 5. Post comment on the PR
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: issueNumber,
-                  body: `### 🤖 Automated Failure Summary\n\n${aiText}\n\n---\n*To rerun tests, comment \`/run tests\` on this PR.*`
+            // 4. Helper function with Promise to ensure it WAITS for response
+            function callAI(token, payload) {
+              return new Promise((resolve) => {
+                const req = https.request({
+                  hostname: 'models.inference.ai.azure.com',
+                  path: '/chat/completions',
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`,
+                    'User-Agent': 'CI-Failure-Triager',
+                    'Content-Length': Buffer.byteLength(payload)
+                  },
+                  timeout: 20000
+                }, (res) => {
+                  let data = '';
+                  res.on('data', chunk => data += chunk);
+                  res.on('end', () => {
+                    try {
+                      const parsed = JSON.parse(data);
+                      if (parsed.choices && parsed.choices[0]) {
+                        resolve(parsed.choices[0].message.content);
+                      } else {
+                        resolve(`Failed step: \`${failedStepName}\`. API Response: ${data}`);
+                      }
+                    } catch (e) {
+                      resolve(`Failed step: \`${failedStepName}\`. (Response parse error: ${e.message})`);
+                    }
+                  });
                 });
+
+                req.on('error', (err) => {
+                  resolve(`Failed step: \`${failedStepName}\`. (Network error: ${err.message})`);
+                });
+
+                req.write(payload);
+                req.end();
               });
+            }
+
+            // 5. Await AI result
+            console.log("Sending request to AI endpoint...");
+            const aiSummary = await callAI(process.env.AI_TOKEN, requestBody);
+            console.log("AI Summary Generated:", aiSummary);
+
+            // 6. Post comment to PR
+            const commentBody = `### 🤖 Automated Failure Summary\n\n${aiSummary}\n\n---\n*To rerun tests, comment \`/run tests\` on this PR.*`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: commentBody
             });
 
-            req.write(payload);
-            req.end();
+            console.log("Comment posted successfully!");
