@@ -91,51 +91,35 @@ jobs:
       - name: Download failed job logs
         env:
           GH_TOKEN: ${{ github.token }}
-          JOB_IDS: ${{ steps.failed-jobs.outputs.job_ids }}
         run: |
           set -uo pipefail
 
           LOG_DIR="$RUNNER_TEMP/failure-logs"
           mkdir -p "$LOG_DIR"
-          : > "$LOG_DIR/combined.log"
 
-          for JOB_ID in $JOB_IDS; do
-            JOB_LOG="$LOG_DIR/job-${JOB_ID}.log"
+          echo "Downloading complete workflow run logs for run ID ${GITHUB_RUN_ID}..."
 
-            echo "Downloading logs for job $JOB_ID"
+          # Download and unzip the full run logs (includes all called workflows & steps)
+          if curl --fail --silent --show-error --location \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/logs" \
+            --output "$LOG_DIR/run_logs.zip"; then
 
-            if curl --fail --silent --show-error --location \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}/logs" \
-              --output "$JOB_LOG"; then
-
-              if [ -s "$JOB_LOG" ]; then
-                cat "$JOB_LOG" >> "$LOG_DIR/combined.log"
-              else
-                echo "Downloaded empty logs for job $JOB_ID" \
-                  >> "$LOG_DIR/combined.log"
-              fi
-
-              printf '\n\n--- End of job %s ---\n\n' "$JOB_ID" \
-                >> "$LOG_DIR/combined.log"
-            else
-              echo "Could not download logs for job $JOB_ID" \
-                >> "$LOG_DIR/combined.log"
-            fi
-          done
-
-          if [ ! -s "$LOG_DIR/combined.log" ]; then
-            echo "No job logs were available." \
-              > "$LOG_DIR/combined.log"
+            unzip -q -o "$LOG_DIR/run_logs.zip" -d "$LOG_DIR/extracted"
+            
+            # Combine all text logs into combined.log
+            find "$LOG_DIR/extracted" -type f -name "*.txt" -exec cat {} + > "$LOG_DIR/combined.log"
+            echo "Logs extracted successfully."
+          else
+            echo "Could not download workflow run zip archive." > "$LOG_DIR/combined.log"
           fi
 
-          tail -c 16000 "$LOG_DIR/combined.log" \
-            > "$LOG_DIR/relevant.log"
+          # Extract the last 16KB of relevant error lines
+          tail -c 16000 "$LOG_DIR/combined.log" > "$LOG_DIR/relevant.log"
 
-          echo "Log collection finished."
-          echo "Collected log size: $(wc -c < "$LOG_DIR/relevant.log") bytes"
+          echo "Log collection finished. Size: $(wc -c < "$LOG_DIR/relevant.log") bytes."
 
       - name: Install GitHub Copilot CLI
         run: npm install -g @github/copilot
