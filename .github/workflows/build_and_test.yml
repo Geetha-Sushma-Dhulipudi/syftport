@@ -4,6 +4,8 @@ permissions:
   contents: write
   statuses: write
   actions: read
+  pull-requests: write
+  issues: write
 
 on:
   issue_comment:
@@ -22,3 +24,85 @@ jobs:
     if: (github.event.issue.pull_request && contains(github.event.comment.body, '/run tests')) || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request_target'
     uses: zopencommunity/meta/.github/workflows/build_and_test.yml@main
     secrets: inherit
+
+  copilot-summarize-failure:
+    needs: build-and-test
+    # Triggers whenever the build-and-test job fails
+    if: always() && needs.build-and-test.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Extract Failed Step Information
+        id: get-failure-info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            const failedJob = jobs.data.jobs.find(j => j.conclusion === 'failure');
+            const jobName = failedJob ? failedJob.name : 'trigger-jenkins-job';
+            core.setOutput('failed_job', jobName);
+
+      - name: 2. Generate Copilot AI Summary & Post Comment
+        uses: actions/github-script@v7
+        env:
+          COPILOT_TOKEN: ${{ secrets.BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            const issueNumber = context.payload.pull_request ? context.payload.pull_request.number : (context.issue ? context.issue.number : null);
+            if (!issueNumber) {
+              console.log('No PR number found, skipping comment.');
+              return;
+            }
+
+            const failedJob = "${{ steps.get-failure-info.outputs.failed_job }}";
+
+            const prompt = `A build and test workflow failed in repository "${context.repo.repo}".
+            Failed Job: "${failedJob}"
+            
+            Please provide a brief failure summary for the PR author:
+            1. **What Failed**: Identify the failed step.
+            2. **Root Cause**: Explain why it failed (e.g., if trigger-jenkins-job failed, explain Jenkins credentials/environment requirements on personal forks).
+            3. **How to Resolve**: Suggest actionable steps to fix or proceed.`;
+
+            let summaryText = "";
+            try {
+              const response = await fetch("https://models.inference.ai.azure.com/chat/completions", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${process.env.COPILOT_TOKEN}`
+                },
+                body: JSON.stringify({
+                  model: "gpt-4o-mini",
+                  messages: [
+                    { role: "system", content: "You are an automated CI failure triager for GitHub Actions." },
+                    { role: "user", content: prompt }
+                  ]
+                })
+              });
+
+              const data = await response.json();
+              if (data.choices && data.choices[0]) {
+                summaryText = data.choices[0].message.content;
+              } else {
+                summaryText = `Failed step: \`${failedJob}\`. Please review the workflow logs for full error details.`;
+              }
+            } catch (err) {
+              summaryText = `The workflow failed at \`${failedJob}\`. Error details: ${err.message}`;
+            }
+
+            const commentBody = `### 🤖 Automated Failure Summary
+            ${summaryText}
+
+            ---
+            *To re-run tests after addressing the issue, comment \`/run tests\` on this PR.*`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: commentBody
+            });
