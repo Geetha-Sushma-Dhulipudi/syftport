@@ -48,6 +48,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot@1.0.102
+
       - name: Verify zopen presence & Run Build Failure Analysis
         id: triage
         env:
